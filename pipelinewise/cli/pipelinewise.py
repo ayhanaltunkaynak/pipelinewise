@@ -24,6 +24,7 @@ from .commands import TapParams, TargetParams, TransformParams
 from .config import Config
 from .alert_sender import AlertSender
 from .alert_handlers.base_alert_handler import BaseAlertHandler
+from .errors import InvalidTransformationException, DuplicateConfigException, InvalidConfigException
 
 FASTSYNC_PAIRS = {
     ConnectorType.TAP_MYSQL: {
@@ -100,7 +101,7 @@ class PipelineWise:
 
         # Catch SIGINT and SIGTERM to exit gracefully
         for sig in [signal.SIGINT, signal.SIGTERM]:
-            signal.signal(sig, self._exit_gracefully)
+            signal.signal(sig, self.stop_tap)
 
     def send_alert(
         self, message: str, level: str = BaseAlertHandler.ERROR, exc: Exception = None
@@ -1201,7 +1202,7 @@ class PipelineWise:
         try:
             with pidfile.PIDFile(self.tap['files']['pidfile']):
                 target_params = TargetParams(
-                    id=target_id,
+                    target_id=target_id,
                     type=target_type,
                     bin=self.target_bin,
                     python_bin=self.target_python_bin,
@@ -1225,7 +1226,7 @@ class PipelineWise:
                         log_dir, f'{target_id}-{tap_id}-{current_time}.fastsync.log'
                     )
                     tap_params = TapParams(
-                        id=tap_id,
+                        tap_id=tap_id,
                         type=tap_type,
                         bin=self.tap_bin,
                         python_bin=self.tap_python_bin,
@@ -1251,7 +1252,7 @@ class PipelineWise:
                         log_dir, f'{target_id}-{tap_id}-{current_time}.singer.log'
                     )
                     tap_params = TapParams(
-                        id=tap_id,
+                        tap_id=tap_id,
                         type=tap_type,
                         bin=self.tap_bin,
                         python_bin=self.tap_python_bin,
@@ -1299,14 +1300,15 @@ class PipelineWise:
         utils.silentremove(tap_properties_singer)
         self._print_tap_run_summary(self.STATUS_SUCCESS, start_time, datetime.now())
 
-    def stop_tap(self):
+    # pylint: disable=unused-argument
+    def stop_tap(self, sig=None, frame=None):
         """
         Stop running tap
 
         The command finds the tap specific pidfile that was created by run_tap command and sends
-        a SIGINT to the process. The SIGINT signal triggers _exit_gracefully function automatically and
-        the tap stops running.
+        a SIGTERM to the process.
         """
+        self.logger.info('Trying to stop tap gracefully...')
         pidfile_path = self.tap['files']['pidfile']
         try:
             with open(pidfile_path, encoding='utf-8') as pidf:
@@ -1315,12 +1317,19 @@ class PipelineWise:
 
                 # Terminate child processes
                 for child in parent.children(recursive=True):
-                    self.logger.info('Sending SIGINT to child pid %s...', child.pid)
-                    child.send_signal(signal.SIGINT)
+                    self.logger.info('Sending SIGTERM to child pid %s...', child.pid)
+                    child.send_signal(signal.SIGTERM)
 
-                # Terminate main process
-                self.logger.info('Sending SIGINT to main pid %s...', parent.pid)
-                parent.send_signal(signal.SIGINT)
+            # Rename log files from running to terminated status
+            if self.tap_run_log_file:
+                tap_run_log_file_running = f'{self.tap_run_log_file}.running'
+                tap_run_log_file_terminated = f'{self.tap_run_log_file}.terminated'
+
+                if os.path.isfile(tap_run_log_file_running):
+                    os.rename(tap_run_log_file_running, tap_run_log_file_terminated)
+
+            sys.exit(1)
+
         except ProcessLookupError:
             self.logger.error(
                 'Pid %s not found. Is the tap running on this machine? '
@@ -1328,6 +1337,7 @@ class PipelineWise:
                 pid,
             )
             sys.exit(1)
+
         except FileNotFoundError:
             self.logger.error(
                 'No pidfile found at %s. Tap does not seem to be running.', pidfile_path
@@ -1414,7 +1424,7 @@ class PipelineWise:
 
                 # Create parameters as NamedTuples
                 tap_params = TapParams(
-                    id=tap_id,
+                    tap_id=tap_id,
                     type=tap_type,
                     bin=self.tap_bin,
                     python_bin=self.tap_python_bin,
@@ -1424,7 +1434,7 @@ class PipelineWise:
                 )
 
                 target_params = TargetParams(
-                    id=target_id,
+                    target_id=target_id,
                     type=target_type,
                     bin=self.target_bin,
                     python_bin=self.target_python_bin,
@@ -1467,6 +1477,7 @@ class PipelineWise:
         yaml_dir = self.args.dir
         self.logger.info('Searching YAML config files in %s', yaml_dir)
         tap_yamls, target_yamls = utils.get_tap_target_names(yaml_dir)
+
         self.logger.info('Detected taps: %s', tap_yamls)
         self.logger.info('Detected targets: %s', target_yamls)
 
@@ -1475,47 +1486,74 @@ class PipelineWise:
 
         vault_secret = self.args.secret
 
-        target_ids = set()
-        # pylint: disable=E1136,E1137  # False positive when loading vault encrypted YAML
+        # dictionary of targets ID and type
+        targets = {}
+
         # Validate target json schemas and that no duplicate IDs exist
         for yaml_file in target_yamls:
-            self.logger.info('Started validating %s', yaml_file)
-            loaded_yaml = utils.load_yaml(
-                os.path.join(yaml_dir, yaml_file), vault_secret
-            )
-            utils.validate(loaded_yaml, target_schema)
+            self.logger.info('Started validating target file: %s', yaml_file)
 
-            if loaded_yaml['id'] in target_ids:
-                self.logger.error('Duplicate target found "%s"', loaded_yaml['id'])
-                sys.exit(1)
+            # pylint: disable=E1136  # False positive when loading vault encrypted YAML
+            target_yml = utils.load_yaml(os.path.join(yaml_dir, yaml_file), vault_secret)
+            utils.validate(target_yml, target_schema)
 
-            target_ids.add(loaded_yaml['id'])
-            self.logger.info('Finished validating %s', yaml_file)
+            if target_yml['id'] in targets:
+                raise DuplicateConfigException(f'Duplicate target found "{target_yml["id"]}"')
+
+            targets[target_yml['id']] = target_yml['type']
+
+            self.logger.info('Finished validating target file: %s', yaml_file)
 
         tap_ids = set()
-        # pylint: disable=E1136,E1137  # False positive when loading vault encrypted YAML
+
         # Validate tap json schemas, check that every tap has valid 'target' and that no duplicate IDs exist
         for yaml_file in tap_yamls:
-            self.logger.info('Started validating %s', yaml_file)
-            loaded_yaml = utils.load_yaml(
-                os.path.join(yaml_dir, yaml_file), vault_secret
-            )
-            utils.validate(loaded_yaml, tap_schema)
+            self.logger.info('Started validating %s ...', yaml_file)
 
-            if loaded_yaml['id'] in tap_ids:
-                self.logger.error('Duplicate tap found "%s"', loaded_yaml['id'])
-                sys.exit(1)
+            # pylint: disable=E1136  # False positive when loading vault encrypted YAML
+            tap_yml = utils.load_yaml(os.path.join(yaml_dir, yaml_file), vault_secret)
+            utils.validate(tap_yml, tap_schema)
 
-            if loaded_yaml['target'] not in target_ids:
-                self.logger.error(
-                    "Can'f find the target with the ID '%s' referenced in '%s'. Available target IDs: %s",
-                    loaded_yaml['target'],
-                    yaml_file,
-                    target_ids,
-                )
-                sys.exit(1)
+            if tap_yml['id'] in tap_ids:
+                raise DuplicateConfigException(f'Duplicate tap found "{tap_yml["id"]}"')
 
-            tap_ids.add(loaded_yaml['id'])
+            if tap_yml['target'] not in targets:
+                raise InvalidConfigException(
+                    f"Can't find the target with the ID '{tap_yml['target']}' referenced in '{yaml_file}'."
+                    f'Available target IDs: {list(targets.keys())}',
+                    )
+
+            tap_ids.add(tap_yml['id'])
+
+            # If there is a fastsync component for this tap-target combo and transformations on json properties are
+            # configured then fail the validation.
+            # The reason being that at the time of writing this, transformations in Fastsync are done on the
+            # target side using mostly SQL UPDATE, and transformations on properties in json fields are not
+            # implemented due to the need of converting XPATH syntax to SQL which has been deemed as not worth it
+            if self.__does_fastsync_component_exist(targets[tap_yml['target']], tap_yml['type']):
+                self.logger.debug('FastSync component found for tap %s', tap_yml['id'])
+
+                # Load the transformations
+                transformations = Config.generate_transformations(tap_yml)
+
+                # check if transformations are using "field_paths" or "field_path" config, fail if so
+                for transformation in transformations:
+                    if transformation.get('field_paths') is not None:
+                        raise InvalidTransformationException(
+                            'This tap-target combo has FastSync component and is configuring a transformation on json '
+                            'properties which are not supported by FastSync!\n'
+                            f'Please omit "field_paths" from the transformation config of tap "{tap_yml["id"]}"'
+                        )
+
+                    if transformation['when'] is not None:
+                        for condition in transformation['when']:
+                            if condition.get('field_path') is not None:
+                                raise InvalidTransformationException(
+                                    'This tap-target combo has FastSync component and is configuring a transformation '
+                                    'conditions on json properties which are not supported by FastSync!\n'
+                                    f'Please omit "field_path" from the transformation config of tap "{tap_yml["id"]}"'
+                                )
+
             self.logger.info('Finished validating %s', yaml_file)
 
         self.logger.info('Validation successful')
@@ -1633,20 +1671,6 @@ class PipelineWise:
                 and 'token' not in stream_bookmark
             )
         )
-
-    # pylint: disable=unused-argument
-    def _exit_gracefully(self, sig, frame, exit_code=1):
-        self.logger.info('Stopping gracefully...')
-
-        # Rename log files from running to terminated status
-        if self.tap_run_log_file:
-            tap_run_log_file_running = f'{self.tap_run_log_file}.running'
-            tap_run_log_file_terminated = f'{self.tap_run_log_file}.terminated'
-
-            if os.path.isfile(tap_run_log_file_running):
-                os.rename(tap_run_log_file_running, tap_run_log_file_terminated)
-
-        sys.exit(exit_code)
 
     def _print_tap_run_summary(self, status, start_time, end_time):
         summary = f"""
@@ -1801,3 +1825,16 @@ TAP RUN SUMMARY
 
             if returncode != 0:
                 return stderr
+
+    @classmethod
+    def __does_fastsync_component_exist(cls, target_type: str, tap_type: str) -> bool:
+        """
+        Checks if the given tap-target combo have FastSync
+        Args:
+            target_type: type of the target
+            tap_type: type of tap
+
+        Returns:
+            Boolean, True if FastSync exists, False otherwise.
+        """
+        return ConnectorType(target_type) in FASTSYNC_PAIRS.get(ConnectorType(tap_type), {})
